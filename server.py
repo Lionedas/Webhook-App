@@ -5,9 +5,11 @@ from google.auth.transport.requests import Request
 from datetime import datetime
 import logging
 import json
+import time
 from logging.handlers import RotatingFileHandler
 import os
 from dotenv import load_dotenv
+
 # Custom log formatter
 class CustomFormatter(logging.Formatter):
     def format(self, record):
@@ -112,15 +114,15 @@ def handle_runelite_payload(data):
     if 'extra' in data and 'items' in data['extra']:
         items = data['extra']['items']
         if items and len(items) > 0:
-             # Get the most valuable item
+            # Get the most valuable item
             items_sorted = sorted(items, key=lambda x: x.get('priceEach', 0) * x.get('quantity', 1), reverse=True)
             item = items_sorted[0]
             return send_loot_notification(
-    item.get('name', 'Unknown'),
-    item.get('quantity', 1),
-    item.get('priceEach', 0) * item.get('quantity', 1),
-    data.get('extra', {}).get('source')
-)
+                item.get('name', 'Unknown'),
+                item.get('quantity', 1),
+                item.get('priceEach', 0) * item.get('quantity', 1),
+                data.get('extra', {}).get('source')
+            )
     
     return jsonify({"status": "ignored", "message": "No valid items in Runelite payload"}), 200
 
@@ -133,7 +135,7 @@ def handle_simple_loot(data):
     )
 
 def send_loot_notification(item_name, quantity, value, source=None):
-    """Send notification to all registered devices"""
+    """Send notification to all registered devices with retry logic"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     title = "OSRS Drop!"
     body = f"{quantity}x {item_name} ({value:,} gp)"
@@ -142,74 +144,103 @@ def send_loot_notification(item_name, quantity, value, source=None):
     body += f" at {timestamp}"
     
     results = []
+    successful_sends = 0
+    failed_sends = 0
+    
     for token in list(registered_tokens):
         try:
-            success = send_fcm_notification(token, title, body)
-            status = "success" if success else "failed"
-            results.append({"token": token[:10] + "...", "status": status})
+            success, attempts = send_fcm_notification_with_retry(token, title, body)
+            if success:
+                successful_sends += 1
+                results.append({
+                    "token": token[:10] + "...",
+                    "status": "success",
+                    "attempts": attempts
+                })
+            else:
+                failed_sends += 1
+                results.append({
+                    "token": token[:10] + "...",
+                    "status": "failed",
+                    "attempts": attempts,
+                    "error": "Max retries exceeded"
+                })
         except Exception as e:
-            results.append({"token": token[:10] + "...", "status": "error", "message": str(e)})
+            failed_sends += 1
+            results.append({
+                "token": token[:10] + "...",
+                "status": "error",
+                "error": str(e)
+            })
+    
+    # Log summary
+    logging.info(
+        f"Notification summary - Success: {successful_sends}, Failed: {failed_sends}, "
+        f"Total devices: {len(registered_tokens)}"
+    )
     
     return jsonify({
-        "status": "success",
+        "status": "success" if successful_sends > 0 else "partial" if failed_sends < len(registered_tokens) else "failed",
         "item": item_name,
         "quantity": quantity,
         "value": value,
         "time": timestamp,
+        "successful_deliveries": successful_sends,
+        "failed_deliveries": failed_sends,
         "notifications": results
-    }), 200
+    }), 200 if successful_sends > 0 else 207  # 207 Multi-Status
 
-def send_fcm_notification(token: str, title: str, body: str) -> bool:
-    """Send notification via FCM with enhanced error handling"""
-    try:
-        print(f"Sending to token: {token[:10]}...")
-        
-        credentials = service_account.Credentials.from_service_account_info(
-            SERVICE_ACCOUNT_INFO,
-            scopes=["https://www.googleapis.com/auth/firebase.messaging"]
-        )
-        credentials.refresh(Request())
-        access_token = credentials.token
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "message": {
-                "token": token,
-                "notification": {
-                    "title": title,
-                    "body": body
-                },
-                "android": {
-                    "priority": "high",
-                    "notification": {
-                        "channel_id": "osrs_notifications",
-                        "sound": "default",
-                        "visibility": "public"
-                    }
-                }
-            }
-        }
-
-        response = requests.post(
-            f"https://fcm.googleapis.com/v1/projects/{SERVICE_ACCOUNT_INFO['project_id']}/messages:send",
-            headers=headers,
-            json=payload,
-            timeout=10
-        )
-        
-        if response.status_code != 200:
-            raise Exception(f"FCM error: {response.status_code} - {response.text}")
+def send_fcm_notification_with_retry(token: str, title: str, body: str, max_retries: int = 4) -> tuple[bool, int]:
+    """Send notification via FCM with retry logic"""
+    attempt = 0
+    last_error = None
+    
+    while attempt <= max_retries:
+        try:
+            attempt += 1
+            credentials = service_account.Credentials.from_service_account_info(
+                SERVICE_ACCOUNT_INFO,
+                scopes=["https://www.googleapis.com/auth/firebase.messaging"]
+            )
+            credentials.refresh(Request())
             
-        print("Notification sent successfully")
-        return True
-        
-    except Exception as e:
-        logging.error(f"FCM notification failed for token {token[:10]}...: {str(e)}")
-        return False
+            response = requests.post(
+                f"https://fcm.googleapis.com/v1/projects/{SERVICE_ACCOUNT_INFO['project_id']}/messages:send",
+                headers={
+                    "Authorization": f"Bearer {credentials.token}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "message": {
+                        "token": token,
+                        "notification": {"title": title, "body": body},
+                        "android": {
+                            "priority": "high",
+                            "notification": {
+                                "channel_id": "osrs_notifications",
+                                "sound": "default",
+                                "visibility": "public"
+                            }
+                        }
+                    }
+                },
+                timeout=10
+            )
+            
+            response.raise_for_status()
+            logging.info(f"Notification sent successfully to {token[:10]}... (attempt {attempt})")
+            return True, attempt
+            
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+            if attempt <= max_retries:
+                retry_delay = 2 ** attempt  # Exponential backoff (2, 4, 8 seconds)
+                logging.warning(f"Attempt {attempt} failed for {token[:10]}... Retrying in {retry_delay}s: {last_error}")
+                time.sleep(retry_delay)
+            else:
+                logging.error(f"Final attempt failed for {token[:10]}...: {last_error}")
+                
+    return False, attempt
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
