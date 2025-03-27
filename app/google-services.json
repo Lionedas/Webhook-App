@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "205125232235",
+    "project_id": "webhook-app-4af2d",
+    "storage_bucket": "webhook-app-4af2d.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:205125232235:android:bbde9ffc41f19d41e6b32e",
+        "android_client_info": {
+          "package_name": "Webhook.App"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA9SmfZcy51Irme1d62z9ExM_IPqsSW2DI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:205125232235:android:0f03056bdf4d1830e6b32e",
+        "android_client_info": {
+          "package_name": "com.example.hookapp"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyA9SmfZcy51Irme1d62z9ExM_IPqsSW2DI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
