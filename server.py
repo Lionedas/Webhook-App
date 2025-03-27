@@ -6,52 +6,105 @@ from datetime import datetime
 import logging
 import json
 import time
-from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Custom log formatter
+# Initialize Flask app
+app = Flask(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# =============================================
+# Token Management System
+# =============================================
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "registered_tokens.json")
+
+def load_tokens():
+    """Robust token loading with multiple fallback strategies"""
+    tokens = set()
+    try:
+        if not Path(TOKEN_FILE).exists():
+            return tokens
+            
+        with open(TOKEN_FILE, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            
+            if not content:
+                return tokens
+                
+            # Attempt 1: Standard JSON parsing
+            try:
+                data = json.loads(content)
+                if isinstance(data, list):
+                    tokens.update(t for t in data if isinstance(t, str) and len(t) > 10)
+                    return tokens
+            except json.JSONDecodeError:
+                pass
+                
+            # Attempt 2: Line-by-line recovery
+            tokens.update(
+                line.strip() for line in content.splitlines() 
+                if len(line.strip()) > 10 and ':' in line
+            )
+            
+    except Exception as e:
+        logging.error(f"Token loading failed: {str(e)}", exc_info=True)
+        
+    return tokens
+
+def save_tokens():
+    """Atomic token saving with backup"""
+    try:
+        # Create backup
+        if Path(TOKEN_FILE).exists():
+            Path(TOKEN_FILE).replace(f"{TOKEN_FILE}.bak")
+            
+        # Write new file
+        temp_file = f"{TOKEN_FILE}.tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(list(registered_tokens), f, indent=2)
+            
+        # Atomic replace
+        Path(temp_file).replace(TOKEN_FILE)
+    except Exception as e:
+        logging.error(f"Token save failed: {str(e)}")
+
+# Initialize token storage
+registered_tokens = load_tokens()
+logging.info(f"Initialized with {len(registered_tokens)} registered tokens")
+
+# =============================================
+# Logging Configuration
+# =============================================
 class CustomFormatter(logging.Formatter):
     def format(self, record):
-        if record.pathname.endswith('server.py'):
-            if 'POST /webhook' in record.getMessage():
-                # Skip Werkzeug's default request logs
-                return ""
+        if record.pathname.endswith('server.py') and 'POST /webhook' in record.getMessage():
+            return ""
         return super().format(record)
 
-# Configure logging
 def setup_logging():
-    # Disable Werkzeug's default handler
     logging.getLogger('werkzeug').setLevel(logging.WARNING)
-    
-    # Create a custom logger
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
-    
-    # Console handler with custom format
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(CustomFormatter(
         fmt='%(asctime)s | %(levelname)s | %(message)s',
         datefmt='%H:%M:%S'
     ))
-    
     logger.addHandler(console_handler)
 
 setup_logging()
 
-app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-registered_tokens = set()
-
-# Load environment variables
-load_dotenv()
-
-# Firebase credentials from .env
+# =============================================
+# Firebase Configuration
+# =============================================
 SERVICE_ACCOUNT_INFO = {
     "type": os.getenv("FIREBASE_TYPE"),
     "project_id": os.getenv("FIREBASE_PROJECT_ID"),
     "private_key_id": os.getenv("FIREBASE_PRIVATE_KEY_ID"),
-    "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace('\\n', '\n'),  # Fix newlines
+    "private_key": os.getenv("FIREBASE_PRIVATE_KEY").replace('\\n', '\n'),
     "client_email": os.getenv("FIREBASE_CLIENT_EMAIL"),
     "client_id": os.getenv("FIREBASE_CLIENT_ID"),
     "auth_uri": os.getenv("FIREBASE_AUTH_URI"),
@@ -60,6 +113,9 @@ SERVICE_ACCOUNT_INFO = {
     "client_x509_cert_url": os.getenv("FIREBASE_CLIENT_CERT_URL")
 }
 
+# =============================================
+# API Endpoints
+# =============================================
 @app.route('/register', methods=['POST'])
 def register_device():
     try:
@@ -67,75 +123,51 @@ def register_device():
         if not data or 'token' not in data:
             return jsonify({"status": "error", "message": "Missing token"}), 400
             
-        token = data['token']
-        registered_tokens.add(token)
-        logging.info(f"Registered new token (Total: {len(registered_tokens)}): {token[:10]}...")
-        
+        token = str(data['token']).strip()
+        if not token or ':' not in token:
+            return jsonify({"status": "error", "message": "Invalid token format"}), 400
+            
+        if token not in registered_tokens:
+            registered_tokens.add(token)
+            save_tokens()
+            logging.info(f"Registered new token (Total: {len(registered_tokens)})")
+            
         return jsonify({
             "status": "success",
-            "message": "Token registered",
-            "registered_tokens": len(registered_tokens)
+            "total_devices": len(registered_tokens),
+            "is_new": token not in registered_tokens
         }), 200
         
     except Exception as e:
-        logging.error(f"Registration error: {str(e)}")
+        logging.error(f"Registration error: {str(e)}", exc_info=True)
         return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        if request.form:
-            data = request.form.to_dict()
-            if 'payload_json' in data:
-                payload = json.loads(data['payload_json'])
-                items = payload.get('extra', {}).get('items', [])
-                
+        if request.form and 'payload_json' in request.form:
+            payload = json.loads(request.form['payload_json'])
+            if 'extra' in payload and 'items' in payload['extra']:
+                items = payload['extra']['items']
                 if items:
-                    # Get the most valuable item
                     top_item = max(items, key=lambda x: x.get('priceEach', 0) * x.get('quantity', 1))
-                    
-                    # Log cleanly
-                    logging.info(
-                        f"LOOT: {top_item['quantity']}x {top_item['name']} "
-                        f"({top_item['priceEach'] * top_item['quantity']:,} gp) "
-                        f"from {payload.get('extra', {}).get('source', 'Unknown')}"
+                    return send_loot_notification(
+                        top_item.get('name', 'Unknown'),
+                        top_item.get('quantity', 1),
+                        top_item.get('priceEach', 0) * top_item.get('quantity', 1),
+                        payload.get('extra', {}).get('source')
                     )
                     
-                    return handle_runelite_payload(payload)
-        
         return jsonify({"status": "ignored"}), 200
-    
+        
     except Exception as e:
-        logging.error(f"Webhook error: {e}")
+        logging.error(f"Webhook error: {str(e)}", exc_info=True)
         return jsonify({"status": "error", "message": str(e)}), 500
 
-def handle_runelite_payload(data):
-    """Process Runelite's specific payload format"""
-    if 'extra' in data and 'items' in data['extra']:
-        items = data['extra']['items']
-        if items and len(items) > 0:
-            # Get the most valuable item
-            items_sorted = sorted(items, key=lambda x: x.get('priceEach', 0) * x.get('quantity', 1), reverse=True)
-            item = items_sorted[0]
-            return send_loot_notification(
-                item.get('name', 'Unknown'),
-                item.get('quantity', 1),
-                item.get('priceEach', 0) * item.get('quantity', 1),
-                data.get('extra', {}).get('source')
-            )
-    
-    return jsonify({"status": "ignored", "message": "No valid items in Runelite payload"}), 200
-
-def handle_simple_loot(data):
-    """Process simple form-based loot notification"""
-    return send_loot_notification(
-        data.get('itemName', 'Unknown'),
-        int(data.get('itemQuantity', 1)),
-        int(data.get('itemValue', 0))
-    )
-
+# =============================================
+# Notification System
+# =============================================
 def send_loot_notification(item_name, quantity, value, source=None):
-    """Send notification to all registered devices with retry logic"""
     timestamp = datetime.now().strftime("%H:%M:%S")
     title = "OSRS Drop!"
     body = f"{quantity}x {item_name} ({value:,} gp)"
@@ -144,60 +176,31 @@ def send_loot_notification(item_name, quantity, value, source=None):
     body += f" at {timestamp}"
     
     results = []
-    successful_sends = 0
-    failed_sends = 0
+    for token in registered_tokens:
+        success, attempts = send_fcm_notification_with_retry(token, title, body)
+        results.append({
+            "token": token[:10] + "...",
+            "status": "success" if success else "failed",
+            "attempts": attempts
+        })
     
-    for token in list(registered_tokens):
-        try:
-            success, attempts = send_fcm_notification_with_retry(token, title, body)
-            if success:
-                successful_sends += 1
-                results.append({
-                    "token": token[:10] + "...",
-                    "status": "success",
-                    "attempts": attempts
-                })
-            else:
-                failed_sends += 1
-                results.append({
-                    "token": token[:10] + "...",
-                    "status": "failed",
-                    "attempts": attempts,
-                    "error": "Max retries exceeded"
-                })
-        except Exception as e:
-            failed_sends += 1
-            results.append({
-                "token": token[:10] + "...",
-                "status": "error",
-                "error": str(e)
-            })
-    
-    # Log summary
-    logging.info(
-        f"Notification summary - Success: {successful_sends}, Failed: {failed_sends}, "
-        f"Total devices: {len(registered_tokens)}"
-    )
+    success_count = sum(1 for r in results if r['status'] == 'success')
+    logging.info(f"Notifications sent: {success_count} successful, {len(results)-success_count} failed")
     
     return jsonify({
-        "status": "success" if successful_sends > 0 else "partial" if failed_sends < len(registered_tokens) else "failed",
+        "status": "success",
         "item": item_name,
         "quantity": quantity,
         "value": value,
         "time": timestamp,
-        "successful_deliveries": successful_sends,
-        "failed_deliveries": failed_sends,
         "notifications": results
-    }), 200 if successful_sends > 0 else 207  # 207 Multi-Status
+    })
 
-def send_fcm_notification_with_retry(token: str, title: str, body: str, max_retries: int = 4) -> tuple[bool, int]:
-    """Send notification via FCM with retry logic"""
+def send_fcm_notification_with_retry(token, title, body, max_retries=3):
     attempt = 0
-    last_error = None
-    
     while attempt <= max_retries:
+        attempt += 1
         try:
-            attempt += 1
             credentials = service_account.Credentials.from_service_account_info(
                 SERVICE_ACCOUNT_INFO,
                 scopes=["https://www.googleapis.com/auth/firebase.messaging"]
@@ -218,29 +221,41 @@ def send_fcm_notification_with_retry(token: str, title: str, body: str, max_retr
                             "priority": "high",
                             "notification": {
                                 "channel_id": "osrs_notifications",
-                                "sound": "default",
-                                "visibility": "public"
+                                "sound": "default"
                             }
                         }
                     }
                 },
                 timeout=10
             )
-            
             response.raise_for_status()
-            logging.info(f"Notification sent successfully to {token[:10]}... (attempt {attempt})")
             return True, attempt
             
-        except requests.exceptions.RequestException as e:
-            last_error = str(e)
+        except Exception as e:
             if attempt <= max_retries:
-                retry_delay = 2 ** attempt  # Exponential backoff (2, 4, 8 seconds)
-                logging.warning(f"Attempt {attempt} failed for {token[:10]}... Retrying in {retry_delay}s: {last_error}")
-                time.sleep(retry_delay)
+                time.sleep(2 ** attempt)
             else:
-                logging.error(f"Final attempt failed for {token[:10]}...: {last_error}")
-                
-    return False, attempt
+                logging.error(f"FCM failed for {token[:10]}...: {str(e)}")
+                return False, attempt
+
+# =============================================
+# Debug Endpoints
+# =============================================
+@app.route('/tokens', methods=['GET'])
+def list_tokens():
+    return jsonify({
+        "total_tokens": len(registered_tokens),
+        "tokens": list(registered_tokens)
+    })
+
+@app.route('/force_reload', methods=['POST'])
+def force_reload():
+    global registered_tokens
+    registered_tokens = load_tokens()
+    return jsonify({
+        "status": "success",
+        "loaded_tokens": len(registered_tokens)
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
